@@ -644,8 +644,6 @@
 #     print("Testing HIGH fatigue scenario")
 #     fatigue_test_flow("high")
 
-
-
 import os
 import io
 import time
@@ -661,15 +659,19 @@ from dotenv import load_dotenv
 # LOAD API KEYS
 # ==============================
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+# Rename the Cloud key variable so it doesn't conflict
+CLOUD_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+# FIX 1: Hide the Cloud key from the environment so Gemini doesn't get confused and throw a 404
+if "GOOGLE_API_KEY" in os.environ:
+    del os.environ["GOOGLE_API_KEY"]
 
 # ==============================
 # INITIALIZE GEMINI CLIENT
 # ==============================
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_KEY)
 
 # ==============================
 # CONFIG
@@ -682,8 +684,9 @@ SILENCE_THRESHOLD = 2  # consecutive silent chunks before stopping listening
 # TTS (Fixed for Windows Stability)
 # ==============================
 def speak(text):
-    print(f"[TTS] {text}")
-    client = texttospeech.TextToSpeechClient(client_options={"api_key": GOOGLE_API_KEY})
+    print(f"\n[TTS] {text}")
+    # Using the renamed CLOUD_API_KEY
+    client = texttospeech.TextToSpeechClient(client_options={"api_key": CLOUD_API_KEY})
     synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
         language_code="en-US",
@@ -715,7 +718,8 @@ def record_chunk(filename="input.wav"):
 # ==============================
 def transcribe(file_path):
     try:
-        client = speech.SpeechClient(client_options={"api_key": GOOGLE_API_KEY})
+        # Using the renamed CLOUD_API_KEY
+        client = speech.SpeechClient(client_options={"api_key": CLOUD_API_KEY})
         with open(file_path, "rb") as f:
             content = f.read()
         audio = speech.RecognitionAudio(content=content)
@@ -746,11 +750,16 @@ def transcribe(file_path):
 # GEMINI RESPONSE
 # ==============================
 def ask_gemini(user_text):
-    response = gemini_client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=f"You are a driving safety assistant.\nDriver said: '{user_text}'.\nRespond in 1-2 sentences, calm and safety-focused."
-    )
-    return response.text
+    try:
+        # FIX 2: Using the exact model string we verified works for your API key
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"You are a driving safety assistant that just alerted the driver to fatigue.\nDriver said: '{user_text}'.\nRespond to them in 1-2 sentences addressing what they said, keep up conversation, calm and safety-focused."
+        )
+        return response.text
+    except Exception as e:
+        print(f"\n[Gemini Error] {e}")
+        return "I'm having trouble connecting to my network right now, please stay safe."
 
 # ==============================
 # LISTEN UNTIL USER STOPS TALKING
@@ -793,27 +802,26 @@ def fatigue_test_flow(fatigue_level):
     elif fatigue_level == "high":
         speak("You seem extremely tired. Please consider pulling over safely.")
 
-    # Fixed function call name
-    print("[Waiting for user response...]")
+    print("\n[Waiting for user response...]")
     user_input = listen_until_speech_and_stop() 
     
     if not user_input:
-        print("[No response detected. Going dormant.]")
+        print("\n[No response detected. Going dormant.]")
         return
 
     # Send to Gemini
     gemini_reply = ask_gemini(user_input)
     speak(gemini_reply)
 
-    # Listen again for follow-up (Fixed function call name)
-    print("[Listening again after Gemini reply...]")
+    # Listen again for follow-up
+    print("\n[Listening again after Gemini reply...]")
     follow_up = listen_until_speech_and_stop()
     
     if follow_up:
         gemini_followup = ask_gemini(follow_up)
         speak(gemini_followup)
     else:
-        print("[Conversation ended. Dormant.]")
+        print("\n[Conversation ended. Dormant.]")
 
 # ==============================
 # RUN TEST
