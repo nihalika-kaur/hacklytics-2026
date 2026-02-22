@@ -1,0 +1,13 @@
+opencv-python>=4.13.0
+mediapipe>=0.10.32
+numpy>=2.4.2
+scipy>=1.17.0
+deepface>=0.0.98
+google-generativeai>=0.8.6
+sounddevice>=0.5.5
+SpeechRecognition>=3.14.5
+PyAudio>=0.2.14
+simpleaudio>=1.0.4
+pydub>=0.25.1
+google-cloud-texttospeech>=2.34.0
+google-cloud-speech>=2.36.1

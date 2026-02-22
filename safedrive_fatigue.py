@@ -2,10 +2,12 @@
 SafeDrive — AI-Enhanced Driver Fatigue Prevention System
 =========================================================
 Geometry-driven, temporal-aware fatigue detection.
-Uses MediaPipe Tasks API (0.10.32+) — no mp.solutions needed.
+TTS: Google AI Studio / Gemini for fatigue alerts (non-blocking).
+After high-fatigue alert: listens to user (Google STT) -> Gemini conversation -> TTS reply.
 
-Dependencies: opencv-python, mediapipe, numpy, scipy
-Controls:    Q=quit  D=toggle mesh  S=snapshot
+Dependencies: opencv-python, mediapipe, numpy, scipy, google-genai, sounddevice, SpeechRecognition
+Set GEMINI_API_KEY (and optionally GOOGLE_API_KEY for STT) — see top of script.
+Controls:    Q=quit  D=toggle mesh  S=snapshot  V=voice (talk to assistant)
 """
 
 import cv2
@@ -18,6 +20,8 @@ from collections import deque
 import time
 import os
 import urllib.request
+import queue
+import threading
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -64,6 +68,209 @@ COL_WHITE = (255, 255, 255)
 COL_GREY = (180, 180, 180)
 COL_PANEL = (30, 30, 30)
 COL_ORANGE = (0, 140, 255)
+
+# --- API keys (use both if you have two) ---
+# GEMINI_API_KEY = Gemini (TTS + chat). Get from https://aistudio.google.com/apikey
+# GOOGLE_API_KEY = optional; used for Google Speech-to-Text when set (else free tier)
+TTS_COOLDOWN_SEC = 30
+TTS_MSG_MEDIUM = "You seem a bit tired. Consider a short break."
+TTS_MSG_HIGH = "You seem very tired. Pull over and rest when it's safe."
+GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"  # TTS-capable model in Google AI Studio
+GEMINI_TTS_VOICE = "Kore"
+# Sample rate for Gemini TTS output (PCM); adjust if API docs differ
+TTS_SAMPLE_RATE = 24000
+
+# --- Conversation (STT -> Gemini -> TTS) after high-fatigue alert ---
+LISTEN_DURATION_SEC = 5
+GEMINI_CHAT_MODEL = "gemini-2.0-flash-exp"
+CONVERSATION_SYSTEM = (
+    "You are a brief, supportive driving assistant. We detected driver fatigue and alerted the user. "
+    "They are now speaking to you. Reply in 1-2 short sentences: be supportive and encourage safe behavior (rest, pull over). "
+    "Keep it conversational."
+)
+
+# ═══════════════════════════════════════════════════════════════
+# GEMINI TTS (non-blocking; runs in background thread, does not block CV)
+# ═══════════════════════════════════════════════════════════════
+
+_tts_queue = queue.Queue(maxsize=2)
+_tts_last_time = 0.0
+_tts_lock = threading.Lock()
+_listen_after_alert = threading.Event()
+_conversation_state = "idle"
+_conversation_state_lock = threading.Lock()
+
+
+def _get_gemini_api_key():
+    """Use for Gemini TTS and Gemini chat. Prefer GEMINI_API_KEY, fallback GOOGLE_API_KEY."""
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
+def _get_google_api_key():
+    """Use for Google STT (Speech-to-Text). Set GOOGLE_API_KEY for your Google/TTS-STT key."""
+    return os.environ.get("GOOGLE_API_KEY")
+
+
+def _set_conversation_state(state: str):
+    global _conversation_state
+    with _conversation_state_lock:
+        _conversation_state = state
+
+
+def get_conversation_state() -> str:
+    with _conversation_state_lock:
+        return _conversation_state
+
+
+def _tts_worker():
+    """Background thread: call Gemini TTS and play audio so main CV loop never blocks."""
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        return
+    try:
+        from google import genai
+        from google.genai import types
+        import sounddevice as sd
+        client = genai.Client(api_key=api_key)
+    except Exception:
+        return
+    while True:
+        try:
+            item = _tts_queue.get()
+            if item is None:
+                break
+            text = item[0] if isinstance(item, (list, tuple)) else item
+            trigger_listen = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else False
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_TTS_MODEL,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=GEMINI_TTS_VOICE,
+                                )
+                            )
+                        ),
+                    ),
+                )
+                if response.candidates and response.candidates[0].content.parts:
+                    part = response.candidates[0].content.parts[0]
+                    pcm_data = None
+                    if hasattr(part, "inline_data") and part.inline_data:
+                        pcm_data = getattr(part.inline_data, "data", None)
+                    if pcm_data:
+                        audio = np.frombuffer(pcm_data, dtype=np.int16)
+                        sd.play(audio, TTS_SAMPLE_RATE, blocking=True)
+                if trigger_listen:
+                    _listen_after_alert.set()
+            except Exception:
+                pass
+            _tts_queue.task_done()
+        except Exception:
+            pass
+
+
+def tts_speak(text: str, trigger_listen_after: bool = False) -> bool:
+    """Queue a TTS message. Non-blocking. If trigger_listen_after=True, we listen for user after this plays (for high-fatigue flow)."""
+    try:
+        _tts_queue.put_nowait((text, trigger_listen_after))
+        return True
+    except queue.Full:
+        return False
+
+
+def tts_should_speak(risk_level: str, now: float) -> bool:
+    """True if we should speak (medium/high and cooldown elapsed). Updates last-speak time."""
+    if not _tts_available:
+        return False
+    with _tts_lock:
+        global _tts_last_time
+        if risk_level not in ("medium", "high"):
+            return False
+        if now - _tts_last_time < TTS_COOLDOWN_SEC:
+            return False
+        _tts_last_time = now
+        return True
+
+
+# Start TTS worker when Gemini key is set (CV runs either way; TTS is optional)
+_tts_available = bool(_get_gemini_api_key())
+if _tts_available:
+    _tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+    _tts_thread.start()
+
+# ═══════════════════════════════════════════════════════════════
+# CONVERSATION: STT (Google) -> Gemini (chat) -> TTS (Gemini)
+# Runs in background; triggered after high-fatigue alert or on V key.
+# ═══════════════════════════════════════════════════════════════
+
+def _conversation_worker():
+    """Listen for user speech (Google STT), send to Gemini, speak reply via TTS. Does not block CV."""
+    gemini_key = _get_gemini_api_key()
+    if not gemini_key:
+        return
+    try:
+        from google import genai
+        import speech_recognition as sr
+        client = genai.Client(api_key=gemini_key)
+        recognizer = sr.Recognizer()
+    except Exception:
+        return
+    google_stt_key = _get_google_api_key()
+    while True:
+        try:
+            if not _listen_after_alert.wait(timeout=0.5):
+                continue
+            _listen_after_alert.clear()
+            _set_conversation_state("listening")
+            user_text = ""
+            try:
+                with sr.Microphone() as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                    audio = recognizer.record(source, duration=LISTEN_DURATION_SEC)
+                if google_stt_key:
+                    user_text = recognizer.recognize_google(audio, key=google_stt_key)
+                else:
+                    user_text = recognizer.recognize_google(audio)
+            except sr.UnknownValueError:
+                user_text = ""
+            except Exception:
+                user_text = ""
+            if not user_text or not user_text.strip():
+                _set_conversation_state("idle")
+                continue
+            _set_conversation_state("thinking")
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_CHAT_MODEL,
+                    contents=f"{CONVERSATION_SYSTEM}\n\nUser said: {user_text}",
+                )
+                reply = getattr(response, "text", None) or ""
+                if not reply and response.candidates and response.candidates[0].content.parts:
+                    for part in response.candidates[0].content.parts:
+                        if hasattr(part, "text") and part.text:
+                            reply += part.text
+                reply = (reply or "").strip()
+                if reply:
+                    tts_speak(reply)
+            except Exception:
+                pass
+            _set_conversation_state("idle")
+        except Exception:
+            _set_conversation_state("idle")
+
+
+def request_conversation():
+    """Call to start listening (after alert or on V key). Safe to call from main thread."""
+    _listen_after_alert.set()
+
+
+if _tts_available:
+    _conversation_thread = threading.Thread(target=_conversation_worker, daemon=True)
+    _conversation_thread.start()
 
 # ═══════════════════════════════════════════════════════════════
 # MEDIAPIPE LANDMARK INDICES (468 FaceMesh)
@@ -390,6 +597,8 @@ def main():
     print("SafeDrive Fatigue Detection — Running")
     print("=" * 50)
     print("Controls: Q=quit  D=toggle mesh  S=snapshot")
+    print("TTS: Gemini alerts (medium/high fatigue). After high alert, app listens then talks with Gemini.")
+    print("V: start voice conversation anytime. Set GEMINI_API_KEY (and optionally GOOGLE_API_KEY for STT).")
     print()
 
     while True:
@@ -541,6 +750,13 @@ def main():
             cv2.rectangle(frame, (16, y0), (16+bar_fill, y0+16), rc, -1)
         cv2.rectangle(frame, (16, y0), (16+bar_total, y0+16), (80, 80, 80), 1)
 
+        # --- Gemini TTS: speak fatigue alert (non-blocking; high alert then triggers listen for conversation) ---
+        if tts_should_speak(risk, now):
+            if risk == "high":
+                tts_speak(TTS_MSG_HIGH, trigger_listen_after=True)
+            elif risk == "medium":
+                tts_speak(TTS_MSG_MEDIUM)
+
         # ═══════════════════════════════════════════════════════
         # EVENT LOG (Right Side)
         # ═══════════════════════════════════════════════════════
@@ -588,7 +804,14 @@ def main():
             draw_panel(frame, ax-15, ay-28, ts[0]+30, 45, 0.55)
             put(frame, txt, (ax, ay), COL_ORANGE, 0.65, 2)
 
-        put(frame, "Q:quit  D:mesh  S:snapshot", (10, h-10), COL_GREY, 0.38)
+        # --- Conversation state (Listening / Thinking) ---
+        conv_state = get_conversation_state()
+        if conv_state == "listening":
+            put(frame, "Listening... (speak now)", (10, h-10), COL_CYAN, 0.45)
+        elif conv_state == "thinking":
+            put(frame, "Thinking...", (10, h-10), COL_YELLOW, 0.45)
+        else:
+            put(frame, "Q:quit  D:mesh  S:snapshot  V:talk", (10, h-10), COL_GREY, 0.38)
 
         cv2.imshow("SafeDrive — Fatigue Detection", frame)
 
@@ -598,6 +821,11 @@ def main():
         elif key == ord("d"):
             show_mesh = not show_mesh
             print(f"Mesh overlay: {'ON' if show_mesh else 'OFF'}")
+        elif key == ord("v"):
+            if _tts_available:
+                request_conversation()
+            else:
+                print("Set GEMINI_API_KEY for voice conversation.")
         elif key == ord("s"):
             fn = f"safedrive_snap_{int(time.time())}.jpg"
             cv2.imwrite(fn, frame)
